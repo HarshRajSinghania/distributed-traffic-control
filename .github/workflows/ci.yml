@@ -53,3 +53,49 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t distributed-traffic-control:${{ github.sha }} .
+
+      - name: Validate Docker image at runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE="distributed-traffic-control:${GITHUB_SHA}"
+          CONTAINER="traffic-control-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          cleanup() {
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d \
+            --name "$CONTAINER" \
+            -p 127.0.0.1::8081 \
+            -e SERVER_PORT=8081 \
+            -e REDIS_HOST=127.0.0.1 \
+            -e REDIS_PORT=6379 \
+            -e NODE_ID=ci-validation \
+            -e LEASE_DURATION=PT30S \
+            -e LEASE_CAPACITY=10 \
+            "$IMAGE"
+
+          PORT=$(docker port "$CONTAINER" 8081/tcp | awk -F: '{print $NF}')
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:${PORT}/actuator/health"; then
+              echo
+              echo "Docker image runtime validation passed."
+              exit 0
+            fi
+
+            if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
+              echo "Container exited before becoming healthy."
+              docker logs "$CONTAINER"
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          echo "Application health endpoint did not become ready in time."
+          docker logs "$CONTAINER"
+          exit 1
