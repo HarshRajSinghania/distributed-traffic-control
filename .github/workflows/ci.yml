@@ -60,25 +60,50 @@ jobs:
           set -Eeuo pipefail
 
           IMAGE="distributed-traffic-control:${GITHUB_SHA}"
-          CONTAINER="traffic-control-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          NETWORK="traffic-control-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          REDIS_CONTAINER="${NETWORK}-redis"
+          APP_CONTAINER="${NETWORK}-app"
 
           cleanup() {
-            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            docker rm -f "$APP_CONTAINER" "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+            docker network rm "$NETWORK" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
+          docker network create "$NETWORK"
+
           docker run -d \
-            --name "$CONTAINER" \
+            --name "$REDIS_CONTAINER" \
+            --network "$NETWORK" \
+            redis:7-alpine
+
+          for attempt in $(seq 1 15); do
+            if docker exec "$REDIS_CONTAINER" redis-cli ping | grep -q PONG; then
+              break
+            fi
+
+            if [ "$attempt" -eq 15 ]; then
+              echo "Redis did not become ready."
+              docker logs "$REDIS_CONTAINER"
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          docker run -d \
+            --name "$APP_CONTAINER" \
+            --network "$NETWORK" \
             -p 127.0.0.1::8081 \
             -e SERVER_PORT=8081 \
-            -e REDIS_HOST=127.0.0.1 \
+            -e REDIS_HOST="$REDIS_CONTAINER" \
             -e REDIS_PORT=6379 \
             -e NODE_ID=ci-validation \
             -e LEASE_DURATION=PT30S \
             -e LEASE_CAPACITY=10 \
             "$IMAGE"
 
-          PORT=$(docker port "$CONTAINER" 8081/tcp | awk -F: '{print $NF}')
+          PORT=$(docker port "$APP_CONTAINER" 8081/tcp | awk -F: '{print $NF}')
 
           for attempt in $(seq 1 30); do
             if curl --fail --silent "http://127.0.0.1:${PORT}/actuator/health"; then
@@ -87,9 +112,9 @@ jobs:
               exit 0
             fi
 
-            if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
-              echo "Container exited before becoming healthy."
-              docker logs "$CONTAINER"
+            if [ "$(docker inspect -f '{{.State.Running}}' "$APP_CONTAINER")" != "true" ]; then
+              echo "Application container exited before becoming healthy."
+              docker logs "$APP_CONTAINER"
               exit 1
             fi
 
@@ -97,5 +122,5 @@ jobs:
           done
 
           echo "Application health endpoint did not become ready in time."
-          docker logs "$CONTAINER"
+          docker logs "$APP_CONTAINER"
           exit 1
